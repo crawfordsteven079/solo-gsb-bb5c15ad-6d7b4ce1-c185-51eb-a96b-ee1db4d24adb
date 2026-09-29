@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .redaction import compile_rule, parse_pointer
+from .redaction import compile_rule, parse_pointer, parse_required_pointer
 
 Action = Literal["mask", "remove", "sha256"]
 
@@ -66,6 +66,30 @@ class RedactRequest(BaseModel):
         default=None,
         description="Named policy reference. Mutually exclusive with inline 'rules'.",
     )
+    protect: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Exact JSON Pointers (RFC 6901, no '*'/'**' globs) that MUST be "
+            "protected on the ORIGINAL document. Pointers that do not exist "
+            "are ignored; every existing pointer must be covered by an "
+            "actually executed mask/remove/sha256 action on itself or an "
+            "ancestor, otherwise the whole request fails with HTTP 412 and "
+            "the uncovered pointers (declaration order). Omitting/emptying "
+            "this list preserves the legacy behaviour."
+        ),
+        examples=[["/users/0/email", "/card"]],
+    )
+
+    @field_validator("protect")
+    @classmethod
+    def _valid_protect_pointers(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return None
+        for pointer in value:
+            # Exact segments only: valid RFC 6901 syntax and no globs.
+            # Raises ValueError -> Pydantic ValidationError -> HTTP 422.
+            parse_required_pointer(pointer)
+        return value
 
     @model_validator(mode="after")
     def _exactly_one_rule_source(self) -> "RedactRequest":
@@ -77,6 +101,11 @@ class RedactRequest(BaseModel):
     def inline_rules(self) -> List[RuleSpec]:
         """Inline rules, defaulting to an empty list for backwards compatibility."""
         return self.rules if self.rules is not None else []
+
+    @property
+    def required_pointers(self) -> Optional[List[str]]:
+        """Protection requirements, or None when the list was not declared."""
+        return self.protect
 
 
 class PolicyUpsert(BaseModel):

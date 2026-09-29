@@ -16,7 +16,7 @@ docker compose up --build
 
 服务在 <http://localhost:8080> 就绪：
 
-- `POST /redact` — 脱敏接口（内联规则或引用策略，二选一）
+- `POST /redact` — 脱敏接口（内联规则或引用策略，二选一；可用 `protect` 声明必须保护的原始路径）
 - `POST /redact/ndjson` — 流式 NDJSON 批量脱敏（`application/x-ndjson`，按查询参数 `name` 引用已存策略）
 - `PUT  /policies/{name}` — 创建/更新策略（ETag 乐观并发控制）
 - `GET  /policies/{name}` — 查询策略最新版本
@@ -88,6 +88,97 @@ docker compose up --build -d
 
 当一个节点被子树规则整体处理（mask/remove/sha256）时，其后代不会重复处理，
 审计轨迹中只记录该子树的最近命中规则。
+
+## 强制保护路径：`protect`（本轮新增）
+
+调用 `POST /redact` 时，除规则来源（内联 `rules` 或命名 `policy`，含锁定历史版本）外，
+可随请求**额外**声明一份必须被保护的原始路径列表：
+
+```json
+{
+  "data": { ... },
+  "rules": [ ... ]            // 或 "policy": {"name": "...", "version": 可选}
+  "protect": ["/users/0/email", "/card/cvv"]
+}
+```
+
+判定规则（全部基于**原始文档**，在任何动作执行之前完成）：
+
+1. **仅允许精确段**：每个条目必须是合法 RFC 6901 JSON Pointer，且**不得**含 `*` / `**`
+   通配段；`""` 表示整个文档根。非法 Pointer（语法错误或含通配段）直接返回
+   **`422 参数错误**，不执行脱敏。
+2. **逐条按原始文档定位**：路径不存在（缺键、越界下标、`-` 追加位、前导零下标如 `01`、
+   中途落到标量）一律**忽略**，不视为失败也不要求覆盖。
+3. **覆盖判定**：存在的路径，只有当**该节点自身或其某个祖先节点**被实际执行了
+   `mask`、`remove` 或 `sha256` 才算覆盖。祖先被子树规则整体处理即荫蔽覆盖全部后代，
+   无需逐叶声明；反之，仅后代被处理**不**覆盖祖先。是否"实际执行"以冲突裁决后的
+   生效规则为准——被更近的祖先短路掉、未真正生效的规则不算。
+4. **数组下标以原始文档为准**：删除数组元素导致的下标重排不影响判定，`protect`
+   中的下标永远指原始位置（与引擎"一次性按原始结构匹配"的保证一致）。
+5. **任一存在路径未覆盖 → 整份文档失败**：返回 **`412 Precondition Failed**，
+   响应体给出按**声明顺序**排列、去重后的未覆盖路径，**不返回 `redacted` 与 `audit`**：
+
+   ```json
+   {
+     "detail": {
+       "error": "protect_paths_uncovered",
+       "message": "one or more existing 'protect' paths were not covered by an actually executed mask/remove/sha256 action",
+       "uncovered": ["/users/0/password", "/card/cvv"]
+     }
+   }
+   ```
+
+6. **全部覆盖**：沿用原有成功响应结构（`redacted` / `audit` / `policy`），保护列表
+   不出现在响应中。
+7. **兼容性**：省略 `protect` 或传空数组时行为与旧版完全一致。内联规则与命名策略
+   （包括指定 `version` 锁定的历史版本）都支持 `protect`，规则间的冲突裁决规则不变；
+   策略/版本不存在仍返回 `404`。
+8. `protect` 只作用于单文档接口 `POST /redact`；`POST /redact/ndjson` 不接受该参数。
+
+调用示例：
+
+```bash
+# 祖先整体 remove，两个叶路径均被荫蔽覆盖 -> 200
+curl -s -X POST http://localhost:8080/redact -H 'Content-Type: application/json' -d '{
+  "data": {"card": {"number": "4111", "cvv": "123"}},
+  "rules": [{"pointer": "/card", "action": "remove"}],
+  "protect": ["/card/number", "/card/cvv"]
+}'
+
+# email 被 mask、password 无人处理，且 /z 是缺失键（忽略）-> 412
+curl -i -X POST http://localhost:8080/redact -H 'Content-Type: application/json' -d '{
+  "data": {"users": [{"email": "a@x.io", "password": "p"}]},
+  "rules": [{"pointer": "/users/*/email", "action": "mask"}],
+  "protect": ["/users/0/email", "/users/0/password", "/z"]
+}'
+# HTTP/1.1 412 Precondition Failed
+# {"detail":{"error":"protect_paths_uncovered", ..., "uncovered":["/users/0/password"]}}
+
+# 数组删除不改变判定：删除原始下标 0 后，原始下标 2 仍按 2 判定 -> 412
+curl -i -X POST http://localhost:8080/redact -H 'Content-Type: application/json' -d '{
+  "data": {"items": ["a", "b", "c"]},
+  "rules": [
+    {"pointer": "/items/0", "action": "remove"},
+    {"pointer": "/items/1", "action": "mask"}
+  ],
+  "protect": ["/items/2"]
+}'
+
+# 含通配段 / 非 Pointer 语法 -> 422
+curl -i -X POST http://localhost:8080/redact -H 'Content-Type: application/json' -d '{
+  "data": {"a": 1}, "rules": [], "protect": ["/users/*/email"]
+}'
+```
+
+与命名策略（含历史版本）一起使用：
+
+```bash
+curl -s -X POST http://localhost:8080/redact -H 'Content-Type: application/json' -d '{
+  "data": {"users": [{"email": "a@x.io", "password": "p"}]},
+  "policy": {"name": "pii", "version": 1},
+  "protect": ["/users/0/email", "/users/0/password"]
+}'
+```
 
 ## 持久化策略库
 
@@ -251,6 +342,11 @@ curl -s -X POST http://localhost:8080/policies/pii/impact \
 
 锁定历史版本：`"policy": {"name": "pii-basic", "version": 1}`。
 
+两种规则来源都可再携带可选字段 `protect`（精确 JSON Pointer 数组），声明哪些
+**原始路径必须被保护**；任一存在路径未被实际生效动作覆盖时整份请求失败
+（`412`，不返回脱敏数据与审计），非法 Pointer 返回 `422`。语义与示例见上文
+[强制保护路径](#强制保护路径protect本轮新增)一节。
+
 响应体：
 
 ```json
@@ -382,6 +478,7 @@ python -m pytest -q
 │   ├── test_ndjson.py   # NDJSON 行解析与流式接口测试（CRLF、空行、限长、坏行、内存上限）
 │   ├── test_impact.py   # 影响预览测试（短路、下标稳定、逐样本差异、404/422）
 │   ├── test_api.py      # /redact HTTP 层集成测试
+│   ├── test_protect.py  # protect 必保护路径测试（祖先覆盖、下标不变位、412/422）
 │   └── test_policies.py # 策略库测试：ETag 生命周期、并发更新、历史复现
 ├── Dockerfile           # 内置 /data 卷点（nobody 可写）
 ├── docker-compose.yml   # 命名卷 policy-data -> /data，8080 端口

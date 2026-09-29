@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 MASK_VALUE = "***REDACTED***"
 
@@ -31,9 +32,29 @@ _REMOVE = object()
 # A path is a tuple of raw object keys / array index strings.
 Path = Tuple[str, ...]
 
+# Segments carrying glob meaning; forbidden in required-protection pointers,
+# which must resolve to one exact node of the original document.
+WILDCARD_SEGMENTS = frozenset(("*", "**"))
+
+# RFC 6901 array index production: "0" or a non-zero-leading decimal integer.
+# "-" (the append marker) and "01" intentionally do not match.
+_ARRAY_INDEX_RE = re.compile(r"^(0|[1-9][0-9]*)$")
+
 
 class InvalidPointer(ValueError):
     """Raised when a rule path is not a syntactically valid JSON Pointer."""
+
+
+class CoverageError(Exception):
+    """Raised when existing required-protection paths are not all covered.
+
+    ``uncovered`` lists the offending pointers in declaration order
+    (duplicates collapsed to first occurrence).
+    """
+
+    def __init__(self, uncovered: List[str]):
+        self.uncovered = uncovered
+        super().__init__(f"required protected paths not covered: {uncovered}")
 
 
 # --------------------------------------------------------------------------- #
@@ -103,6 +124,82 @@ def to_pointer(path: Path) -> str:
     if not path:
         return ""
     return "".join("/" + seg.replace("~", "~0").replace("/", "~1") for seg in path)
+
+
+def parse_required_pointer(pointer: str) -> List[str]:
+    """Parse a required-protection pointer: a valid exact RFC 6901 pointer.
+
+    Unlike rule pointers, glob segments (``*`` / ``**``) are rejected because
+    a protection requirement must name one exact node of the original
+    document.
+    """
+    segments = parse_pointer(pointer)
+    for segment in segments:
+        if segment in WILDCARD_SEGMENTS:
+            raise InvalidPointer(
+                f"invalid required pointer {pointer!r}: "
+                "wildcard segments ('*'/'**') are not allowed"
+            )
+    return segments
+
+
+# --------------------------------------------------------------------------- #
+# Required-protection coverage
+# --------------------------------------------------------------------------- #
+
+
+def path_exists(data: Any, segments: Sequence[str]) -> bool:
+    """Whether an exact JSON Pointer resolves on the ORIGINAL document.
+
+    A pointer exists only if every object key / array index resolves. Array
+    indices follow RFC 6901 (``0`` or non-zero-leading digits); the ``-``
+    append marker does not resolve. Resolution happens before any action is
+    applied, so deletions can never shift the judgement.
+    """
+    node = data
+    for segment in segments:
+        if isinstance(node, dict):
+            if segment not in node:
+                return False
+            node = node[segment]
+        elif isinstance(node, list):
+            match = _ARRAY_INDEX_RE.match(segment)
+            if match is None or int(segment) >= len(node):
+                return False
+            node = node[int(segment)]
+        else:
+            return False
+    return True
+
+
+def uncovered_required(
+    data: Any,
+    required: Sequence[str],
+    hits: Dict[Path, CompiledRule],
+) -> List[str]:
+    """Return required pointers not actually acted on, in declaration order.
+
+    Pointers that do not resolve on the original document are ignored. An
+    existing pointer is covered when the node itself, or one of its ancestors,
+    is an actually executed (mask/remove/sha256) hit -- i.e. it appears in
+    ``hits`` keyed at the node path or at a strict prefix. Duplicate
+    declarations are reported only once, at the position of first occurrence.
+    """
+    uncovered: List[str] = []
+    seen: set[str] = set()
+    for pointer in required:
+        if pointer in seen:
+            continue
+        seen.add(pointer)
+        segments = tuple(parse_required_pointer(pointer))
+        if not path_exists(data, segments):
+            continue
+        covered = any(
+            segments[: len(hit_path)] == hit_path for hit_path in hits
+        )
+        if not covered:
+            uncovered.append(pointer)
+    return uncovered
 
 
 # --------------------------------------------------------------------------- #
@@ -213,13 +310,26 @@ def redact(
     data: Any,
     rules: List[CompiledRule],
     salt: str = "",
+    required: Optional[Sequence[str]] = None,
 ) -> Tuple[Any, List[Dict[str, Any]]]:
     """Return ``(redacted_value, audit_trail)`` for the given rules.
 
     The input value is never mutated; a deep copy is produced implicitly by
     rebuilding every container during the walk.
+
+    When ``required`` is given, each entry must be an exact JSON Pointer.
+    Entries that do not resolve on the original document are ignored; every
+    entry that does resolve must be actually covered (itself or an ancestor
+    hit by mask/remove/sha256). If any is not, :class:`CoverageError` is
+    raised *before* the document is rebuilt, so no redacted value or audit is
+    produced. All matching resolves against the original document, so array
+    deletions cannot shift the judgement.
     """
     hits = build_hits(data, rules)
+    if required:
+        missing = uncovered_required(data, required, hits)
+        if missing:
+            raise CoverageError(missing)
     audit: List[Dict[str, Any]] = []
     result = _apply(data, (), hits, salt, audit)
     if result is _REMOVE:

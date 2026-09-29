@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import config, policy_store
 from . import impact as impact_preview
 from .ndjson import iter_ndjson_lines
-from .redaction import redact
+from .redaction import CoverageError, redact
 from .schemas import (
     NAME_PATTERN,
     ImpactRequest,
@@ -39,11 +39,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="JSON Redaction API",
-    version="2.0.0",
+    version="2.1.0",
     description=(
         "Redact arbitrary JSON using JSON Pointer rules with * / ** globs. "
         "Rule sets can be supplied inline or referenced from an immutable, "
-        "versioned policy library."
+        "versioned policy library. Requests may additionally declare exact "
+        "JSON Pointers that must be protected; an uncovered path fails the "
+        "whole document (HTTP 412)."
     ),
     lifespan=lifespan,
 )
@@ -285,7 +287,19 @@ def policy_impact(name: PolicyName, body: ImpactRequest) -> JSONResponse:
     tags=["redact"],
     responses={
         404: {"description": "Referenced policy or pinned version does not exist."},
-        422: {"description": "Invalid rules, or both/neither rule source misconfigured."},
+        412: {
+            "description": (
+                "A declared 'protect' pointer exists on the original document "
+                "but is not covered by any actually executed mask/remove/sha256 "
+                "action; no redacted data or audit is returned."
+            )
+        },
+        422: {
+            "description": (
+                "Invalid rules, both/neither rule source misconfigured, or a "
+                "malformed 'protect' pointer (non-RFC 6901 or wildcard segment)."
+            )
+        },
     },
 )
 def redact_endpoint(request: RedactRequest) -> JSONResponse:
@@ -317,7 +331,30 @@ def redact_endpoint(request: RedactRequest) -> JSONResponse:
     # Compile specs inside the handler so an invalid pointer produces a clean
     # 422 (Pydantic ValidationError -> FastAPI) rather than a 500.
     rules = compile_specs(rule_specs)
-    redacted, audit = redact(request.data, rules, salt=config.get_salt())
+
+    # Coverage enforcement runs inside the engine, on the original document,
+    # before any action is applied -- on failure no redacted value or audit
+    # exists to leak. Applies identically to inline rules and policies,
+    # including pinned historical versions (conflict arbitration is unchanged).
+    try:
+        redacted, audit = redact(
+            request.data,
+            rules,
+            salt=config.get_salt(),
+            required=request.required_pointers,
+        )
+    except CoverageError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_412_PRECONDITION_FAILED,
+            detail={
+                "error": "protect_paths_uncovered",
+                "message": (
+                    "one or more existing 'protect' paths were not covered by "
+                    "an actually executed mask/remove/sha256 action"
+                ),
+                "uncovered": exc.uncovered,
+            },
+        )
 
     # Stamp every audit record with the concrete policy actually applied;
     # historical pins stay reproducible because the snapshot never changes.
