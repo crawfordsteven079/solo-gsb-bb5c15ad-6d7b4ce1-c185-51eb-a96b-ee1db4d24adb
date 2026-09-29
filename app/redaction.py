@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Sequence, Tuple
 
 MASK_VALUE = "***REDACTED***"
 
@@ -274,3 +275,60 @@ def _apply(
         return out
 
     return value
+
+
+# --------------------------------------------------------------------------- #
+# Required-pointer coverage
+# --------------------------------------------------------------------------- #
+
+# RFC 6901 array index tokens: "0" or a digit sequence without a leading zero.
+_ARRAY_INDEX = re.compile(r"^(0|[1-9][0-9]*)$")
+
+
+def path_exists(data: Any, segments: Sequence[str]) -> bool:
+    """Whether ``segments`` locate a node in the ORIGINAL document.
+
+    Object keys must be present literally; array tokens must be valid,
+    in-range RFC 6901 indices (``-`` and leading-zero tokens never resolve).
+    """
+    node = data
+    for segment in segments:
+        if isinstance(node, dict):
+            if segment not in node:
+                return False
+            node = node[segment]
+        elif isinstance(node, list):
+            if not _ARRAY_INDEX.fullmatch(segment):
+                return False
+            index = int(segment)
+            if index >= len(node):
+                return False
+            node = node[index]
+        else:
+            return False
+    return True
+
+
+def uncovered_required(
+    data: Any,
+    required: Sequence[str],
+    audit: List[Dict[str, Any]],
+) -> List[str]:
+    """Declared pointers that exist in ``data`` but were not acted upon.
+
+    A declared pointer is *covered* when the node itself or any of its
+    ancestors appears in the audit trail, i.e. an effective mask/remove/
+    sha256 actually ran on it (the audit already reflects subtree
+    short-circuiting and original array indices). Pointers that do not
+    resolve against the original document are ignored. The result preserves
+    declaration order, duplicates included.
+    """
+    acted = {tuple(parse_pointer(entry["pointer"])) for entry in audit}
+    uncovered: List[str] = []
+    for pointer in required:
+        segments = parse_pointer(pointer)
+        if not path_exists(data, segments):
+            continue
+        if not any(tuple(segments[:k]) in acted for k in range(len(segments) + 1)):
+            uncovered.append(pointer)
+    return uncovered

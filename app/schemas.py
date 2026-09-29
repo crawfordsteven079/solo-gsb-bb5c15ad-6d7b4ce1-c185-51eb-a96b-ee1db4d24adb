@@ -66,6 +66,32 @@ class RedactRequest(BaseModel):
         default=None,
         description="Named policy reference. Mutually exclusive with inline 'rules'.",
     )
+    require: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Exact JSON Pointers (no '*'/'**' segments) that must end up covered "
+            "by an effective mask/remove/sha256 action. Pointers that do not "
+            "exist in the original document are ignored; if any existing pointer "
+            "is left uncovered, the whole request fails with 422 and neither "
+            "redacted data nor audit is returned."
+        ),
+        examples=[["/users/0/email", "/users/0/ssn"]],
+    )
+
+    @field_validator("require")
+    @classmethod
+    def _valid_required_pointers(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return value
+        for pointer in value:
+            # Raises ValueError -> Pydantic ValidationError -> HTTP 422.
+            segments = parse_pointer(pointer)
+            if any(segment in ("*", "**") for segment in segments):
+                raise ValueError(
+                    f"required pointer {pointer!r} must use exact segments only; "
+                    "'*' and '**' are not allowed"
+                )
+        return value
 
     @model_validator(mode="after")
     def _exactly_one_rule_source(self) -> "RedactRequest":

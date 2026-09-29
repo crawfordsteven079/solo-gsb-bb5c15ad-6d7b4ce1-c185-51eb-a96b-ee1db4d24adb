@@ -277,6 +277,60 @@ curl -s -X POST http://localhost:8080/policies/pii/impact \
     时此处展示原子解析出的版本号）；内联规则时该字段缺省。
 - 顶层 `policy`：与审计中的含义相同；内联请求为 `null`。
 
+## 必须覆盖声明：`require`
+
+`POST /redact` 可随请求声明一组**必须被保护**的原始 JSON Pointer，用于强制校验
+"这些字段确实被脱敏了"，避免规则漏配导致敏感字段原样流出：
+
+```json
+{
+  "data": { "users": [{ "email": "a@x.io", "ssn": "123-45" }] },
+  "rules": [{ "pointer": "/users/*/email", "action": "mask" }],
+  "require": ["/users/0/email", "/users/0/ssn"]
+}
+```
+
+- **仅允许精确段**：每个条目必须是合法 JSON Pointer，且不得含 `*` / `**` 通配段
+  （`~0`/`~1` 转义属于精确段，允许）；非法 Pointer 或含通配段 → `422` 参数错误。
+- **逐个按原始文档定位**：声明的路径不存在（含数组下标越界、`-`、前导零下标等
+  无法定位的段）时**忽略**，不参与判定。
+- **覆盖判定**：存在的路径，只有它**自身或某个祖先节点**被实际执行了
+  `mask` / `remove` / `sha256`（即出现在审计轨迹中）才算覆盖；仅后代被处理不算。
+  判定全部基于**原始文档**路径，数组元素被删除后的下标位移不影响结果。
+- **任一存在路径未覆盖**：整份文档失败，返回 `422`，响应体按**声明顺序**列出
+  未覆盖路径，**不返回** `redacted` 与 `audit`：
+
+  ```json
+  {
+    "detail": {
+      "error": "required_pointers_uncovered",
+      "message": "declared required pointers exist in the document but ...",
+      "uncovered": ["/users/0/ssn"]
+    }
+  }
+  ```
+
+- **全部覆盖**：响应与未声明时完全一致（`redacted` / `audit` / `policy`）。
+- 未声明 `require`（或传空列表）的请求行为与旧版完全兼容；`require` 与内联
+  `rules`、`policy` 引用（含锁定历史版本）均可自由组合，冲突裁决规则不变。
+
+```bash
+# 内联规则 + 覆盖声明
+curl -s -X POST http://localhost:8080/redact \
+  -H 'Content-Type: application/json' \
+  -d '{"data":{"users":[{"email":"a@x.io","ssn":"123-45"}]},
+       "rules":[{"pointer":"/users/*/email","action":"mask"},
+                {"pointer":"/users/*/ssn","action":"sha256"}],
+       "require":["/users/0/email","/users/0/ssn"]}'
+
+# 命名策略（可锁定历史版本）+ 覆盖声明
+curl -s -X POST http://localhost:8080/redact \
+  -H 'Content-Type: application/json' \
+  -d '{"data":{"users":[{"email":"a@x.io","ssn":"123-45"}]},
+       "policy":{"name":"pii","version":2},
+       "require":["/users/0/email","/users/0/ssn"]}'
+```
+
 ## 端到端示例
 
 ```bash
@@ -379,6 +433,7 @@ python -m pytest -q
 ├── tests/
 │   ├── conftest.py      # 每测例一个临时 SQLite 库
 │   ├── test_engine.py   # 引擎单元测试（通配、优先级、数组稳定性、根节点等）
+│   ├── test_require.py  # require 必须覆盖声明：定位、祖先覆盖、下标稳定、422
 │   ├── test_ndjson.py   # NDJSON 行解析与流式接口测试（CRLF、空行、限长、坏行、内存上限）
 │   ├── test_impact.py   # 影响预览测试（短路、下标稳定、逐样本差异、404/422）
 │   ├── test_api.py      # /redact HTTP 层集成测试

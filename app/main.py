@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import config, policy_store
 from . import impact as impact_preview
 from .ndjson import iter_ndjson_lines
-from .redaction import redact
+from .redaction import redact, uncovered_required
 from .schemas import (
     NAME_PATTERN,
     ImpactRequest,
@@ -39,11 +39,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="JSON Redaction API",
-    version="2.0.0",
+    version="2.1.0",
     description=(
         "Redact arbitrary JSON using JSON Pointer rules with * / ** globs. "
         "Rule sets can be supplied inline or referenced from an immutable, "
-        "versioned policy library."
+        "versioned policy library. Requests may declare required exact "
+        "pointers that must be covered by an effective action."
     ),
     lifespan=lifespan,
 )
@@ -285,7 +286,12 @@ def policy_impact(name: PolicyName, body: ImpactRequest) -> JSONResponse:
     tags=["redact"],
     responses={
         404: {"description": "Referenced policy or pinned version does not exist."},
-        422: {"description": "Invalid rules, or both/neither rule source misconfigured."},
+        422: {
+            "description": (
+                "Invalid rules, both/neither rule source misconfigured, invalid "
+                "required pointers, or declared required pointers left uncovered."
+            )
+        },
     },
 )
 def redact_endpoint(request: RedactRequest) -> JSONResponse:
@@ -318,6 +324,26 @@ def redact_endpoint(request: RedactRequest) -> JSONResponse:
     # 422 (Pydantic ValidationError -> FastAPI) rather than a 500.
     rules = compile_specs(rule_specs)
     redacted, audit = redact(request.data, rules, salt=config.get_salt())
+
+    # Required-pointer coverage: every declared pointer that exists in the
+    # original document must have been acted upon (itself or via an
+    # ancestor). Any miss fails the whole request -- no redacted data, no
+    # audit -- with the uncovered pointers in declaration order.
+    if request.require:
+        uncovered = uncovered_required(request.data, request.require, audit)
+        if uncovered:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "required_pointers_uncovered",
+                    "message": (
+                        "declared required pointers exist in the document but "
+                        "were not covered by any effective mask/remove/sha256 "
+                        "action"
+                    ),
+                    "uncovered": uncovered,
+                },
+            )
 
     # Stamp every audit record with the concrete policy actually applied;
     # historical pins stay reproducible because the snapshot never changes.
